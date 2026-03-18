@@ -406,8 +406,40 @@ httpd_thread(void *arg)
             continue;
         } else if (ret == -1) {
             int sock_err = SOCKET_GET_ERROR();
+            
+            #ifdef _WIN32
+            if (sock_err == 10038 || sock_err == WSAENOTSOCK) {
+                logger_log(httpd->logger, LOGGER_INFO, "httpd: detected invalid socket (10038), cleaning up...");
+                
+                // 1. Check client connections
+                for (i = 0; i < httpd->max_connections; i++) {
+                    if (!httpd->connections[i].connected) continue;
+                    
+                    int fd = httpd->connections[i].socket_fd;
+                    // Robust way to check if socket is still valid on Windows
+                    int secondary_err;
+                    int optlen = sizeof(secondary_err);
+                    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, (char*)&secondary_err, &optlen) == -1) {
+                        logger_log(httpd->logger, LOGGER_INFO, "purging stale connection on socket %d", fd);
+                        // Use the proper removal function
+                        httpd_remove_connection(httpd, &httpd->connections[i], 0);
+                    }
+                }
+
+                // 2. Check server sockets (if these are bad, we must restart)
+                int optval;
+                int optlen = sizeof(optval);
+                if (httpd->server_fd4 != -1 && getsockopt(httpd->server_fd4, SOL_SOCKET, SO_TYPE, (char*)&optval, &optlen) == -1) {
+                    logger_log(httpd->logger, LOGGER_ERR, "IPv4 Server socket became invalid.");
+                    break; // Fatal
+                }
+                
+                continue; // Go back to start of while(1) and try select() again with clean FDs
+            }
+            #endif
+
             logger_log(httpd->logger, LOGGER_ERR,
-		       "httpd error in select: %d %s", sock_err, SOCKET_ERROR_STRING(sock_err));
+		        "httpd error in select: %d %s", sock_err, SOCKET_ERROR_STRING(sock_err));
             break;
         }
 

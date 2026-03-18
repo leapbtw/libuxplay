@@ -20,6 +20,8 @@
  * Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
  */
 
+#include "uxplay_api.h"
+
 #include <stddef.h>
 #include <cstring>
 #include <unistd.h>
@@ -145,6 +147,8 @@ static std::string metadata_filename = "";
 static bool do_append_hostname = true;
 static bool use_random_hw_addr = false;
 static unsigned short display[5] = {0}, tcp[3] = {0}, udp[3] = {0};
+static GMainLoop *g_loop = NULL;
+static bool do_shutdown = false;
 static bool debug_log = DEFAULT_DEBUG_LOG;
 static bool suppress_packet_debug_data = false;
 static int log_level = LOGGER_INFO;
@@ -672,7 +676,9 @@ static gboolean video_eos_watch_callback (gpointer loop) {
 static void main_loop()  {
     guint gst_video_bus_watch_id[MAX_VIDEO_RENDERERS] = { 0 };
     guint gst_audio_bus_watch_id[MAX_AUDIO_RENDERERS] = { 0 };
-    GMainLoop *loop = g_main_loop_new(NULL,FALSE);
+    //GMainLoop *loop = g_main_loop_new(NULL,FALSE);
+    g_loop = g_main_loop_new(NULL, FALSE);
+    GMainLoop *loop = g_loop;
     relaunch_video = false;
     monitor_progress = false;
     reset_loop = false;
@@ -2879,16 +2885,16 @@ static void read_config_file(const char * filename, const char * uxplay_name) {
 /* workaround for GStreamer >= 1.22 "Official Builds" on macOS */
 #include <TargetConditionals.h>
 #include <gst/gstmacos.h>
-void real_main (int argc, char *argv[]);
+static void real_main (int argc, char *argv[]);
 
-int main (int argc, char *argv[]) {
+int start_uxplay (int argc, char *argv[]) {
     LOGI("*=== Using gst_macos_main wrapper for GStreamer >= 1.22 on macOS ===*");
     return  gst_macos_main ((GstMainFunc) real_main, argc, argv , NULL);
 }
 
-void real_main (int argc, char *argv[]) {
+static void real_main (int argc, char *argv[]) {
 #else
-int main (int argc, char *argv[]) {
+int start_uxplay (int argc, char *argv[]) {
 #endif
     std::vector<char> server_hw_addr;
     std::string config_file = "";
@@ -3242,6 +3248,13 @@ int main (int argc, char *argv[]) {
     compression_type = 0;
     close_window = new_window_closing_behavior;
     main_loop();
+        if (do_shutdown) {
+        LOGI("Stopping RAOP Server...");
+        stop_raop_server();
+        stop_dnssd();
+        cleanup();
+        return 0;
+    }
     if (relaunch_video) {
         if (reset_httpd) {
             raop_stop_httpd(raop);
@@ -3279,7 +3292,17 @@ int main (int argc, char *argv[]) {
     }
     cleanup();
 }
- 
+
+void stop_uxplay() {
+    do_shutdown = true;
+    reset_loop = true;
+    stop_raop_server();
+    stop_dnssd();
+    if (g_loop && g_main_loop_is_running(g_loop)) {
+        g_main_loop_quit(g_loop);
+    }
+}
+
 static void cleanup() {
     if (use_audio) {
         audio_renderer_destroy();
