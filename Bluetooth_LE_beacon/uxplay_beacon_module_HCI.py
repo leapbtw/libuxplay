@@ -11,7 +11,6 @@
 #         %hciusers ALL=(ALL) NOPASSWD: /usr/sbin/hccontrol
 # (3) add the users who will run uxplay-beacon.py to the group hciusers
 
-
 import subprocess
 import time
 import re
@@ -19,6 +18,11 @@ import subprocess
 import platform
 from typing import Optional
 from typing import Literal
+
+#global variables
+hci = None
+advertised_port = None
+advertised_address = None
 
 os_name = platform.system()
 linux =  os_name == 'Linux'
@@ -47,7 +51,6 @@ elif freebsd:
     * source tree.   It is  available at the UxPlay github site Wiki:     *
     * https://github.com/FDH2/UxPlay/wiki/hccontrol-patch-for-FreeBSD-15.0*
     ***********************************************************************
-    wget https://github.com/user-attachments/files/26074904/hccontrol_FreeBSD_15_0_patch.txt
 
     '''
     print(disclaimer)
@@ -61,12 +64,6 @@ help_text3 = '''
 '''
 help_text = help_text1 + help_text2 + help_text3
 
-hci = None
-
-
-advertised_port = None
-advertised_address = None
-
 sudo = ['sudo', '-n']
 if linux:
    ogf = "0x08"
@@ -79,13 +76,10 @@ elif freebsd:
       subprocess.run(cmd, capture_output=True, text=True, check=True)
         
 def setup_beacon(ipv4_str: str, port: int, advmin: int, advmax: int, index: Literal[None]) -> bool:
-    print("setup_beacon")
-    global hci
     global advertised_port
     global advertised_address
     advertised_port = None
     advertised_address = None
-
 
     # setup Advertising Parameters
     if linux:
@@ -106,7 +100,7 @@ def setup_beacon(ipv4_str: str, port: int, advmin: int, advmax: int, index: Lite
     try:
         result = le_cmd(hcicmd, args)
     except subprocess.CalledProcessError as e:
-        print(f'beacon_on error (set_advertisng_parameters):', e.stderr, e.stdout)
+        print(f'beacon_on error (set_advertising_parameters):', e.stderr, e.stdout)
         return False
      
     # setup Advertising Data      
@@ -138,7 +132,6 @@ def setup_beacon(ipv4_str: str, port: int, advmin: int, advmax: int, index: Lite
 def beacon_on() -> Optional[int]:
     global advertised_port
     global advertised_address
-
     if linux:
        hcicmd  = '0x000a'
        args = ['0x01']
@@ -152,10 +145,12 @@ def beacon_on() -> Optional[int]:
         advertised_port = None
         advertised_address = None
         return None
-    print(f'AirPlay Service-Discovery beacon transmission started')
+    print(f'AirPlay Service-Discovery beacon transmission started {advertised_address}:{advertised_port}')
     return advertised_port
 
 def beacon_off():
+    global advertised_port
+    global advertised_address    
     if linux:
         hcicmd = '0x000a'
         args = ['0x00']
@@ -231,7 +226,7 @@ from typing import Optional
 def find_device(hci_in: Optional[str]) -> Optional[str]:
     global hci
     list = list_devices_by_version(min_version=6)
-    if len(list) == 0:
+    if list is None or len(list) == 0:
         return None
     hci = None
     if hci_in is not None:

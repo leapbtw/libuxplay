@@ -1,8 +1,4 @@
-if ( APPLE )
-  cmake_minimum_required( VERSION 3.13 )
-else ()
-  cmake_minimum_required( VERSION 3.10 )
-endif ()
+cmake_minimum_required( VERSION 3.13 )
 
 project( uxplay )
 
@@ -31,15 +27,19 @@ if ( ( UNIX AND NOT APPLE ) OR USE_X11 )
   endif()
 endif()
 
-# FIXME: DBUS support currently disabled
-# if( UNIX AND NOT APPLE )
-#   find_package(PkgConfig REQUIRED)
-#   pkg_check_modules(DBUS dbus-1>=1.4.12)
-#   if (DBUS_FOUND )
-#       add_definitions(-DDBUS )
-#       include_directories(${DBUS_INCLUDE_DIRS})
-#   endif()
-# endif()
+if( UNIX AND NOT APPLE )
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(DBUS dbus-1>=1.4.12)
+  if (DBUS_FOUND )
+      add_definitions(-DDBUS )
+      include_directories(${DBUS_INCLUDE_DIRS})
+      #FreeBSD has this Library in /usr/local/lib
+      find_library (DBUS_LIBRARY NAMES dbus-1 PATHS /usr/local/lib)
+      if (NOT DBUS_LIBRARY)
+      	 message(FATAL_ERROR "libdbus-1 not found")
+      endif()
+  endif()
+endif()
 
 if( UNIX AND NOT APPLE )
   add_definitions( -DSUPPRESS_AVAHI_COMPAT_WARNING )
@@ -59,50 +59,51 @@ if  ( GST_MACOS )
      message ( STATUS "define GST_MACOS" )
 endif()
 
-find_package(Qt6 COMPONENTS Core REQUIRED)
+add_executable( uxplay uxplay.cpp )
+target_link_libraries( uxplay renderers airplay )
+if (DBUS_FOUND)
+      target_link_libraries( uxplay ${DBUS_LIBRARY})
+endif()
 
-add_library(uxplay STATIC uxplay.cpp)
-target_link_libraries( uxplay
-                   renderers
-                   airplay
-                   Qt6::Core
-		   )
-# if (DBUS_FOUND)
-# target_link_libraries( uxplay
-# 		     ${DBUS_LIBRARIES}
-# 		     )
-# endif()
+install( TARGETS  uxplay RUNTIME DESTINATION bin )
+install( FILES uxplay.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1 )
+install( FILES README.md README.txt README.html LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR} ) 
+install( FILES lib/llhttp/LICENSE-MIT DESTINATION ${CMAKE_INSTALL_DOCDIR}/llhttp )
+install( FILES uxplay.service DESTINATION ${CMAKE_INSTALL_DOCDIR}/systemd ) 
+install( FILES Bluetooth_LE_beacon/uxplay-beacon.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1 )
+install( FILES Bluetooth_LE_beacon/uxplay-beacon.py
+         DESTINATION bin
+         PERMISSIONS OWNER_EXECUTE OWNER_WRITE OWNER_READ GROUP_EXECUTE GROUP_READ  WORLD_EXECUTE WORLD_READ)
+install( FILES Bluetooth_LE_beacon/uxplay_beacon_module_BleuIO.py
+         DESTINATION bin
+         PERMISSIONS  OWNER_WRITE OWNER_READ GROUP_READ WORLD_READ)
 
-# TODO: Dont install anything for now
-# install( TARGETS  uxplay RUNTIME DESTINATION bin )
-# install( FILES uxplay.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1 )
-# install( FILES README.md README.txt README.html LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR} )
-# install( FILES lib/llhttp/LICENSE-MIT DESTINATION ${CMAKE_INSTALL_DOCDIR}/llhttp )
-# install( FILES uxplay.service DESTINATION ${CMAKE_INSTALL_DOCDIR}/systemd )
+if (DBUS_FOUND)
+install( FILES Bluetooth_LE_beacon/uxplay_beacon_module_BlueZ.py
+         DESTINATION bin
+         PERMISSIONS OWNER_WRITE OWNER_READ GROUP_READ WORLD_READ)
+endif()
 
-# if (DBUS_FOUND)
-# install( FILES Bluetooth_LE_beacon/dbus/uxplay-beacon.py
-#          DESTINATION bin
-#          PERMISSIONS OWNER_EXECUTE OWNER_WRITE OWNER_READ GROUP_EXECUTE GROUP_READ  WORLD_EXECUTE WORLD_READ)
-# install( FILES Bluetooth_LE_beacon/dbus/uxplay-beacon.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1 )
-# endif()
+if (WIN32)
+install( FILES Bluetooth_LE_beacon/uxplay_beacon_module_winrt.py
+         DESTINATION bin
+         PERMISSIONS OWNER_WRITE OWNER_READ GROUP_READ WORLD_READ)
+endif()
 
-# if (WIN32)
-# install( FILES Bluetooth_LE_beacon/winrt/uxplay-beacon.py
-#          DESTINATION bin
-#          PERMISSIONS OWNER_EXECUTE OWNER_WRITE OWNER_READ GROUP_EXECUTE GROUP_READ  WORLD_EXECUTE WORLD_READ)
-# install( FILES Bluetooth_LE_beacon/winrt/uxplay-beacon.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1 )
-# endif()
+if (UNIX AND NOT APPLE)
+install( FILES Bluetooth_LE_beacon/uxplay_beacon_module_HCI.py
+         DESTINATION bin
+         PERMISSIONS OWNER_WRITE OWNER_READ GROUP_READ WORLD_READ)
+endif()
 
 
+# uninstall target
+if(NOT TARGET uninstall)
+  configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake_uninstall.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake"
+    IMMEDIATE @ONLY)
 
-# # uninstall target
-# if(NOT TARGET uninstall)
-#   configure_file(
-#     "${CMAKE_CURRENT_SOURCE_DIR}/cmake_uninstall.cmake.in"
-#     "${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake"
-#     IMMEDIATE @ONLY)
-
-#   add_custom_target(uninstall
-#     COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake)
-# endif()
+  add_custom_target(uninstall
+    COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake)
+endif()

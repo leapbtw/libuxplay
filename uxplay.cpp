@@ -75,7 +75,7 @@
 #endif
 
 
-#define VERSION "1.73.4"
+#define VERSION "1.73.6"
 
 #define SECOND_IN_USECS 1000000
 #define SECOND_IN_NSECS 1000000000UL
@@ -225,10 +225,7 @@ static bool dbus_last_message = false;
 static const char *appname = DEFAULT_NAME;
 static const char *reason_always = "mirroring client: inhibit always";
 static const char *reason_active = "actively receiving video";
-static int activity_count;
 static float previous_hls_position = 0.0f;
-static double activity_threshold = 500000.0;  // threshold for FPSdata item txUsageAvg to classify mirror video as "active"
-#define MAX_ACTIVITY_COUNT 60
 #endif
 
 /* logging */
@@ -928,7 +925,7 @@ static void print_info (char *name) {
     printf("          v = 2 or 3 (default 3) optionally selects video player version\n");
     printf("-lang xx  HLS language preferences (\"fr:es:..\", overrides $LANGUAGE)\n");
     printf("-lang     (or -lang 0): play undubbed HLS version (overrides $LANGUAGE)\n");
-    printf("-scrsv n  Screensaver override n: 0=off 1=on during activity 2=always on\n");
+    printf("-scrsv n  Screensaver override n: 0=off 1=on while displaying video 2=always on\n");
     printf("-pin[xxxx]Use a 4-digit pin code to control client access (default: no)\n");
     printf("          default pin is random: optionally use fixed pin xxxx\n");
     printf("-reg [fn] Keep a register in $HOME/.uxplay.register to verify returning\n");
@@ -2363,23 +2360,11 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
 }
 
 #ifdef DBUS
-extern "C" void mirror_video_activity  (void *cls, double *txusage) {
+extern "C" void mirror_video_running  (void *cls, bool is_running) {
     if (scrsv != 1) {
         return;
     }
-    if (*txusage > activity_threshold) {
-        if (activity_count < MAX_ACTIVITY_COUNT) {
-            activity_count++;
-        } else if (activity_count == MAX_ACTIVITY_COUNT  && !dbus_last_message) {
-	    dbus_screensaver_inhibiter(true);
-        }
-    } else {
-      if (activity_count > 0) {
-          activity_count--;
-      } else if (activity_count == 0 && dbus_last_message) {
-          dbus_screensaver_inhibiter(false);
-      }
-    }
+    dbus_screensaver_inhibiter(is_running);
 }
 #endif
 
@@ -2732,7 +2717,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.video_reset = video_reset;
     raop_cbs.video_set_codec = video_set_codec;
 #ifdef DBUS
-    raop_cbs.mirror_video_activity = mirror_video_activity;
+    raop_cbs.mirror_video_running = mirror_video_running;
 #endif
     raop_cbs.on_video_play = on_video_play;
     raop_cbs.on_video_scrub = on_video_scrub;
@@ -2974,6 +2959,10 @@ int start_uxplay (int argc, char *argv[]) {
     LOGI("UxPlay %s: An Open-Source AirPlay mirroring and audio-streaming server.", VERSION);
 
 #ifdef DBUS
+    if (scrsv && !use_video) {
+        LOGI ("-scrsv = %d will be ignored, as no video will be rendered", scrsv);
+        scrsv = 0;
+    }
     if (scrsv) {
         DBusError dbus_error;
         dbus_error_init(&dbus_error);
@@ -3013,7 +3002,7 @@ int start_uxplay (int argc, char *argv[]) {
         }
 
         LOGI("Will attempt to use %s (D-Bus screensaver inhibition) %s", dbus_service.c_str(),
-             (scrsv == 1 ? "only during screen activity" : "always"));
+             (scrsv == 1 ? "while displaying mirrored or streamed video" : "always"));
         if (scrsv == 2) {
             dbus_screensaver_inhibiter(true);
         }

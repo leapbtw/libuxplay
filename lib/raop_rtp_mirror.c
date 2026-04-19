@@ -809,12 +809,6 @@ raop_rtp_mirror_thread(void *arg)
                         uint32_t plist_len = 0;
                         plist_t root_node = NULL;
                         plist_from_bin((char *) payload, plist_size, &root_node);
-                        if (raop_rtp_mirror->callbacks.mirror_video_activity) {
-                            double txusage = 0.0;
-                            plist_t tx_usage_avg_node = plist_dict_get_item(root_node, "txUsageAvg");
-                            plist_get_real_val(tx_usage_avg_node, &txusage);
-                            raop_rtp_mirror->callbacks.mirror_video_activity(raop_rtp_mirror->callbacks.cls, &txusage);
-                        }
                         if (raop_rtp_mirror->show_client_FPS_data) {
                             plist_to_xml(root_node, &plist_xml, &plist_len);
                             logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "%s", plist_xml);
@@ -847,6 +841,9 @@ raop_rtp_mirror_thread(void *arg)
     MUTEX_LOCK(raop_rtp_mirror->run_mutex);
     raop_rtp_mirror->running = false;
     MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
+    if (raop_rtp_mirror->callbacks.mirror_video_running) {
+        raop_rtp_mirror->callbacks.mirror_video_running(raop_rtp_mirror->callbacks.cls, false);
+    }
 
     logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror exiting TCP thread");
     if (conn_reset&& raop_rtp_mirror->callbacks.conn_reset) {
@@ -925,6 +922,9 @@ raop_rtp_mirror_start(raop_rtp_mirror_t *raop_rtp_mirror, unsigned short *mirror
     /* Create the thread and initialize running values */
     raop_rtp_mirror->running = 1;
     raop_rtp_mirror->joined = 0;
+    if (raop_rtp_mirror->callbacks.mirror_video_running) {
+        raop_rtp_mirror->callbacks.mirror_video_running(raop_rtp_mirror->callbacks.cls, true);
+    }
 
     THREAD_CREATE(raop_rtp_mirror->thread_mirror, raop_rtp_mirror_thread, raop_rtp_mirror);
     MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
