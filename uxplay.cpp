@@ -42,6 +42,7 @@
 #include <glib.h>
 #include <unordered_map>
 #include <winsock2.h>
+#include <windows.h>
 #include <iphlpapi.h>
 #include <pthread.h>   //for pthreads in MSYS2 UCRT
 #else
@@ -324,12 +325,71 @@ static void dbus_screensaver_inhibiter(bool inhibit) {
 }
 #endif
 
+/*
+ * UxPlay receives filenames as UTF-8.  The narrow CRT file APIs interpret
+ * those bytes using the active Windows code page, which makes paths under a
+ * non-ASCII user profile inaccessible.  Keep the POSIX calls unchanged and
+ * use the wide CRT APIs on Windows.
+ */
+#ifdef _WIN32
+static std::wstring utf8_to_wide(const char *value) {
+    if (!value) {
+        return {};
+    }
+
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1,
+                                     nullptr, 0);
+    if (length == 0) {
+        return {};
+    }
+
+    std::wstring wide_value(length, L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1,
+                            wide_value.data(), length) == 0) {
+        return {};
+    }
+    wide_value.pop_back(); // Drop the terminating NUL included by length.
+    return wide_value;
+}
+
+static FILE *fopen_utf8(const char *filename, const char *mode) {
+    std::wstring wide_filename = utf8_to_wide(filename);
+    std::wstring wide_mode = utf8_to_wide(mode);
+    if (wide_filename.empty() || wide_mode.empty()) {
+        return nullptr;
+    }
+    return _wfopen(wide_filename.c_str(), wide_mode.c_str());
+}
+
+static int access_utf8(const char *filename, int mode) {
+    std::wstring wide_filename = utf8_to_wide(filename);
+    return wide_filename.empty() ? -1 : _waccess(wide_filename.c_str(), mode);
+}
+
+static int remove_utf8(const char *filename) {
+    std::wstring wide_filename = utf8_to_wide(filename);
+    return wide_filename.empty() ? -1 : _wremove(wide_filename.c_str());
+}
+#else
+static FILE *fopen_utf8(const char *filename, const char *mode) {
+    return fopen(filename, mode);
+}
+
+static int access_utf8(const char *filename, int mode) {
+    return access(filename, mode);
+}
+
+static int remove_utf8(const char *filename) {
+    return remove(filename);
+}
+#endif
+
 static bool file_has_write_access (const char * filename) {
     bool exists = false;
     bool write = false;
 #ifdef _WIN32
-    if ((exists = _access(filename, 0) != -1)) {
-        write = (_access(filename, 2) != -1);
+    if ((exists = access_utf8(filename, 0) != -1)) {
+        write = (access_utf8(filename, 2) != -1);
     }
 #else
     if ((exists = access(filename, F_OK) != -1)) {
@@ -337,11 +397,11 @@ static bool file_has_write_access (const char * filename) {
     }
 #endif
     if (!exists) {
-        FILE *fp = fopen(filename, "w");
+        FILE *fp = fopen_utf8(filename, "w");
         if (fp) {
             write = true;
 	    fclose(fp);
-	    remove(filename);
+	    remove_utf8(filename);
         }
     }
     return write;
@@ -357,7 +417,7 @@ static const unsigned char empty_image[] = {
     0x21, 0xbc, 0x33, 0x00, 0x00, 0x00, 0x00, 0x49,  0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82 };
 
 static size_t write_coverart(const char *filename, const void *image, size_t len) {
-    FILE *fp = fopen(filename, "wb");
+    FILE *fp = fopen_utf8(filename, "wb");
     if (!fp) {
         printf("Failed to open file %s\n", filename);
         return 0;
@@ -368,7 +428,7 @@ static size_t write_coverart(const char *filename, const void *image, size_t len
 }
 
 static size_t write_metadata(const char *filename, const char *text) {
-    FILE *fp = fopen(filename, "wb");
+    FILE *fp = fopen_utf8(filename, "wb");
     if (!fp) {
         printf("Failed to open file %s\n", filename);
         return 0;
@@ -381,7 +441,7 @@ static size_t write_metadata(const char *filename, const char *text) {
 static int write_bledata( const uint32_t *pid, const char *process_name, const char *filename) {
     char name[16] { 0 };
     size_t len = strlen(process_name);
-    FILE *fp = fopen(filename, "wb");
+    FILE *fp = fopen_utf8(filename, "wb");
     if (!fp) {
         printf("Failed to open file %s\n", filename);
         return 0;
@@ -482,7 +542,7 @@ static void dump_audio_to_file(unsigned char *data, int datalen, unsigned char t
             snprintf(suffix, sizeof(suffix), ".%d.aud", audio_dumpfile_count);
         }
         fn.append(suffix);
-        audio_dumpfile = fopen(fn.c_str(),"w");
+        audio_dumpfile = fopen_utf8(fn.c_str(),"w");
         if (audio_dumpfile == NULL) {
             LOGE("could not open file %s for dumping audio frames",fn.c_str());
         }
@@ -518,7 +578,7 @@ static void dump_video_to_file(unsigned char *data, int datalen) {
             fn.append(suffix);
         }
         fn.append(".h264");
-        video_dumpfile = fopen (fn.c_str(),"w");
+        video_dumpfile = fopen_utf8(fn.c_str(),"w");
         if (video_dumpfile == NULL) {
             LOGE("could not open file %s for dumping h264 frames",fn.c_str());
         }
@@ -2218,7 +2278,7 @@ extern "C" const char *passwd(void *cls, int *len){
 
 extern "C" void export_dacp(void *cls, const char *active_remote, const char *dacp_id) {
       if (dacpfile.length()) {
-        FILE *fp = fopen(dacpfile.c_str(), "w");
+        FILE *fp = fopen_utf8(dacpfile.c_str(), "w");
         if (fp) {
             fprintf(fp,"%s\n%s\n", dacp_id, active_remote);
             fclose(fp);
@@ -2244,7 +2304,7 @@ extern "C" void conn_destroy (void *cls) {
             audio_renderer_stop();
         }
         if (dacpfile.length()) {
-            remove (dacpfile.c_str());
+            remove_utf8(dacpfile.c_str());
         }
         if (mux_to_file) {
             mux_renderer_stop();
@@ -2568,7 +2628,7 @@ extern "C" void register_client(void *cls, const char *device_id, const char *cl
     LOGI("registered new client: %s DeviceID = %s PK = \n%s", client_name, device_id, client_pk);
     registered_keys.push_back(client_pk);
     if (strlen(pairing_register.c_str())) {
-        FILE *fp = fopen(pairing_register.c_str(), "a");
+        FILE *fp = fopen_utf8(pairing_register.c_str(), "a");
         if (fp) {
             fprintf(fp, "%s,%s,%s\n", client_pk, device_id, client_name);
             fclose(fp);
@@ -3309,13 +3369,13 @@ static void cleanup() {
         fclose(video_dumpfile);
     }
     if (coverart_filename.length()) {
-        remove (coverart_filename.c_str());
+        remove_utf8(coverart_filename.c_str());
     }
     if (metadata_filename.length()) {
-        remove (metadata_filename.c_str());
+        remove_utf8(metadata_filename.c_str());
     }
     if (ble_filename.length()) {
-        remove (ble_filename.c_str());
+        remove_utf8(ble_filename.c_str());
     }
 #ifdef DBUS
     if (dbus_connection) {
