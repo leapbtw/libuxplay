@@ -44,6 +44,7 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <mutex>
 #include <pthread.h>   //for pthreads in MSYS2 UCRT
 #else
 #include <csignal>
@@ -226,9 +227,17 @@ static bool dbus_last_message = false;
 static const char *appname = DEFAULT_NAME;
 static const char *reason_always = "mirroring client: inhibit always";
 static const char *reason_active = "actively receiving video";
+#endif
+
+#if defined(DBUS) || defined(_WIN32)
 static float previous_hls_position = 0.0f;
 #endif
 
+#ifdef _WIN32
+static HANDLE windows_power_request = INVALID_HANDLE_VALUE;
+static bool windows_power_request_active = false;
+static std::mutex windows_power_request_mutex;
+#endif
 /* logging */
 
 static void log(int level, const char* format, ...) {
@@ -322,6 +331,76 @@ static void dbus_screensaver_inhibiter(bool inhibit) {
     dbus_connection_flush(dbus_connection);
     dbus_message_unref(dbus_message);
     dbus_last_message = inhibit;
+}
+#endif
+
+#ifdef _WIN32
+static bool windows_screensaver_request_init() {
+    std::lock_guard<std::mutex> lock(windows_power_request_mutex);
+    if (windows_power_request != INVALID_HANDLE_VALUE) {
+        return true;
+    }
+
+    static wchar_t reason[] = L"UxPlay is displaying video";
+    REASON_CONTEXT context = {};
+    context.Version = POWER_REQUEST_CONTEXT_VERSION;
+    context.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING;
+    context.Reason.SimpleReasonString = reason;
+
+    windows_power_request = PowerCreateRequest(&context);
+    if (windows_power_request == INVALID_HANDLE_VALUE) {
+        LOGE("Unable to create Windows display power request (error %lu)",
+             static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+    return true;
+}
+
+static bool windows_screensaver_inhibiter(bool inhibit) {
+    std::lock_guard<std::mutex> lock(windows_power_request_mutex);
+    if (windows_power_request == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    if (windows_power_request_active == inhibit) {
+        return true;
+    }
+
+    BOOL success = inhibit
+        ? PowerSetRequest(windows_power_request, PowerRequestDisplayRequired)
+        : PowerClearRequest(windows_power_request, PowerRequestDisplayRequired);
+    if (!success) {
+        LOGE("Unable to %s Windows display power request (error %lu)",
+             inhibit ? "set" : "clear",
+             static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+
+    windows_power_request_active = inhibit;
+    LOGD("screen_saver: Windows display power request %s",
+         inhibit ? "active" : "released");
+    return true;
+}
+
+static bool windows_screensaver_is_inhibited() {
+    std::lock_guard<std::mutex> lock(windows_power_request_mutex);
+    return windows_power_request_active;
+}
+
+static void windows_screensaver_request_destroy() {
+    std::lock_guard<std::mutex> lock(windows_power_request_mutex);
+    if (windows_power_request == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    if (windows_power_request_active) {
+        if (!PowerClearRequest(windows_power_request, PowerRequestDisplayRequired)) {
+            LOGE("Unable to clear Windows display power request during shutdown (error %lu)",
+                 static_cast<unsigned long>(GetLastError()));
+        }
+        windows_power_request_active = false;
+    }
+    CloseHandle(windows_power_request);
+    windows_power_request = INVALID_HANDLE_VALUE;
 }
 #endif
 
@@ -1334,10 +1413,10 @@ static void parse_arguments (int argc, char *argv[]) {
                 fprintf(stderr, "invalid \"-scrsv %s\"; values 0, 1, 2 allowed\n", argv[i]);
                 exit(1);
             }
-#ifdef DBUS
+#if defined(DBUS) || defined(_WIN32)
             scrsv = n;
 #else
-            fprintf(stderr,"invalid: option \"-scrsv\" is currently only implemented for Linux/*BSD systems with D-Bus service\n");
+            fprintf(stderr,"invalid: option \"-scrsv\" is currently only implemented for Windows and Linux/*BSD systems with D-Bus service\n");
             exit(1);
 #endif
         } else if (arg == "-vsync") {
@@ -2419,12 +2498,16 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
     }
 }
 
-#ifdef DBUS
+#if defined(DBUS) || defined(_WIN32)
 extern "C" void mirror_video_running  (void *cls, bool is_running) {
     if (scrsv != 1) {
         return;
     }
+#ifdef DBUS
     dbus_screensaver_inhibiter(is_running);
+#elif defined(_WIN32)
+    windows_screensaver_inhibiter(is_running);
+#endif
 }
 #endif
 
@@ -2707,14 +2790,28 @@ extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *play
     playback_info->ready_to_play = true; //?
     playback_info->playback_likely_to_keep_up = true; //?
     
-#ifdef DBUS
+#if defined(DBUS) || defined(_WIN32)
     /*  this seems to be  called every second for first 900 secs (15 mins?) of HLS video, and subsequently
-	at 30 second intervals (use it to signal HLS video activity to  the  DBus screensaver inhibitor) */
+	at 30 second intervals (use it to signal HLS video activity to the screensaver inhibitor) */
     if (scrsv == 1) {
-        if (playback_info->position > previous_hls_position && !dbus_last_message) {
+        bool screensaver_is_inhibited = false;
+#ifdef DBUS
+        screensaver_is_inhibited = dbus_last_message;
+#elif defined(_WIN32)
+        screensaver_is_inhibited = windows_screensaver_is_inhibited();
+#endif
+        if (playback_info->position > previous_hls_position && !screensaver_is_inhibited) {
+#ifdef DBUS
             dbus_screensaver_inhibiter(true);
-        } else if (playback_info->position == previous_hls_position && dbus_last_message) {
+#elif defined(_WIN32)
+            windows_screensaver_inhibiter(true);
+#endif
+        } else if (playback_info->position == previous_hls_position && screensaver_is_inhibited) {
+#ifdef DBUS
             dbus_screensaver_inhibiter(false);
+#elif defined(_WIN32)
+            windows_screensaver_inhibiter(false);
+#endif
         }
         previous_hls_position = playback_info->position;
     }
@@ -2776,7 +2873,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.export_dacp = export_dacp;
     raop_cbs.video_reset = video_reset;
     raop_cbs.video_set_codec = video_set_codec;
-#ifdef DBUS
+#if defined(DBUS) || defined(_WIN32)
     raop_cbs.mirror_video_running = mirror_video_running;
 #endif
     raop_cbs.on_video_play = on_video_play;
@@ -3065,6 +3162,25 @@ int start_uxplay (int argc, char *argv[]) {
              (scrsv == 1 ? "while displaying mirrored or streamed video" : "always"));
         if (scrsv == 2) {
             dbus_screensaver_inhibiter(true);
+        }
+    }
+#endif
+#ifdef _WIN32
+    if (scrsv && !use_video) {
+        LOGI("-scrsv = %d will be ignored, as no video will be rendered", scrsv);
+        scrsv = 0;
+    }
+    if (scrsv) {
+        if (!windows_screensaver_request_init()) {
+            LOGW("Windows screensaver inhibition will not be active");
+            scrsv = 0;
+        } else {
+            LOGI("Will use Windows display power requests to inhibit the screensaver %s",
+                 (scrsv == 1 ? "while displaying mirrored or streamed video" : "always"));
+            if (scrsv == 2 && !windows_screensaver_inhibiter(true)) {
+                LOGW("Windows screensaver inhibition will not be active");
+                scrsv = 0;
+            }
         }
     }
 #endif
@@ -3389,6 +3505,9 @@ static void cleanup() {
         }
         dbus_connection_unref(dbus_connection);
     }
+#endif
+#ifdef _WIN32
+    windows_screensaver_request_destroy();
 #endif
     exit(0);
 }
