@@ -345,7 +345,7 @@ static std::wstring utf8_to_wide(const char *value) {
 
     std::wstring wide_value(length, L'\0');
     if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1,
-                            wide_value.data(), length) == 0) {
+                            &wide_value[0], length) == 0) {
         return {};
     }
     wide_value.pop_back(); // Drop the terminating NUL included by length.
