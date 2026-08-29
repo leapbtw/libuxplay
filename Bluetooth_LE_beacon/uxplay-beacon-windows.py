@@ -10,6 +10,13 @@ import socket
 import argparse
 import psutil
 
+# Windows may choose a legacy code page (for example cp1252) for redirected
+# output. Paths containing characters outside that code page would then make
+# print() raise UnicodeEncodeError and terminate the beacon process.
+for stream in (sys.stdout, sys.stderr):
+    if stream is not None and hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+
 try:
     import winrt.windows.foundation.collections
     import winrt.windows.devices.bluetooth.advertisement as ble_adv
