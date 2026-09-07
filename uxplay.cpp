@@ -46,6 +46,7 @@
 #include <iphlpapi.h>
 #include <mutex>
 #include <pthread.h>   //for pthreads in MSYS2 UCRT
+#include <io.h>
 #else
 #include <csignal>
 #include <glib-unix.h>
@@ -243,23 +244,42 @@ static std::mutex windows_power_request_mutex;
 static void log(int level, const char* format, ...) {
     va_list vargs;
     if (level > log_level) return;
+    const char *prefix = "";
     switch (level) {
     case 0:
     case 1:
     case 2:
     case 3:
-        printf("*** ERROR: ");
+        prefix = "*** ERROR: ";
         break;
     case 4:
-        printf("*** WARNING: ");
+        prefix = "*** WARNING: ";
         break;
     default:
         break;
     }
     va_start(vargs, format);
-    vprintf(format, vargs);
-    printf("\n");
+    va_list measure;
+    va_copy(measure, vargs);
+    const int length = vsnprintf(nullptr, 0, format, measure);
+    va_end(measure);
+    if (length < 0) {
+        va_end(vargs);
+        return;
+    }
+    std::vector<char> message(static_cast<size_t>(length) + 1);
+    vsnprintf(message.data(), message.size(), format, vargs);
     va_end(vargs);
+    std::string line(prefix);
+    line.append(message.data(), static_cast<size_t>(length));
+    if (line.empty() || line.back() != '\n') line += '\n';
+    // Emit the prefix, message and newline together to prevent interleaving.
+#ifdef _WIN32
+    // Unbuffered UCRT fwrite can split off its last byte; use one native write.
+    _write(_fileno(stdout), line.data(), static_cast<unsigned>(line.size()));
+#else
+    fwrite(line.data(), 1, line.size(), stdout);
+#endif
 }
 
 #define LOGD(...) log(LOGGER_DEBUG, __VA_ARGS__)
@@ -2826,22 +2846,8 @@ extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *play
 }
 
 extern "C" void log_callback (void *cls, int level, const char *msg) {
-    switch (level) {
-    case LOGGER_DEBUG:
-        LOGD("%s", msg);
-        break;
-    case LOGGER_WARNING:
-        LOGW("%s", msg);
-        break;
-    case LOGGER_INFO:
-        LOGI("%s", msg);
-        break;
-    case LOGGER_ERR:
-        LOGE("%s", msg);
-        break;
-    default:
-        break;
-    }
+    // Preserve DEBUG_DATA, NOTICE and critical levels as well.
+    log(level, "%s", msg);
 }
 
 static int start_raop_server (unsigned short display[5], unsigned short tcp[3], unsigned short udp[3], bool debug_log) {
@@ -3106,11 +3112,9 @@ int start_uxplay (int argc, char *argv[]) {
     }
 
     
-#ifdef _WIN32    /*  use utf-8 terminal output; don't buffer stdout in WIN32 when debug_log = false */
+#ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
-    if (!debug_log) {
-        setbuf(stdout, NULL);
-    }
+    // The GUI host configures unbuffered output before the first write.
 #endif
 
     LOGI("UxPlay %s: An Open-Source AirPlay mirroring and audio-streaming server.", VERSION);
