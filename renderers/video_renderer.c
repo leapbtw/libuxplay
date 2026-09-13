@@ -222,6 +222,33 @@ GstElement *make_video_sink(const char *videosink, const char *videosink_options
     return video_sink;
 }
 
+#ifdef NEED_G_STRING_REPLACE
+guint
+g_string_replace (GString     *string,
+                  const gchar *find,
+                  const gchar *replace,
+                  guint        limit)
+{
+  if (find == NULL || find[0] == '\0')
+    return 0;
+
+  gchar **parts = g_strsplit (string->str, find, limit + 1);
+  if (parts == NULL || parts[0] == NULL)
+    {
+      g_strfreev (parts);
+      return 0;
+    }
+
+  gchar *joined = g_strjoinv (replace, parts);
+  g_strfreev (parts);
+
+  g_string_assign (string, joined);
+  g_free (joined);
+
+  return g_strv_length (parts);
+}
+#endif
+
 void video_renderer_init(logger_t *render_logger, const char *server_name, videoflip_t videoflip[2], const char *parser, const char * rtp_pipeline,
                           const char *decoder, const char *converter, const char *videosink, const char *videosink_options, 
                           bool initial_fullscreen, bool video_sync, bool h265_support, bool coverart_support, guint playbin_version, const char *uri) {
@@ -1152,4 +1179,13 @@ bool video_renderer_eos_watch() {
 	return true;
     }
     return false; 
+}
+
+void video_renderer_hls_set_volume(double volume) {
+    if (!renderer || strcmp(renderer->codec, hls)) {
+       return;
+    }
+    volume = (volume > 10.0) ? 10.0 : volume;
+    volume = (volume < 0.0) ? 0.0 : volume;
+    g_object_set(renderer->pipeline, "volume", volume, NULL);
 }

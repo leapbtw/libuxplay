@@ -78,7 +78,7 @@
 #endif
 
 
-#define VERSION "1.73.6"
+#define VERSION "1.73.7"
 
 #define SECOND_IN_USECS 1000000
 #define SECOND_IN_NSECS 1000000000UL
@@ -2603,6 +2603,7 @@ extern "C" void audio_set_volume (void *cls, float volume) {
         gst_volume = pow(10.0, 0.05*db);
     }
     audio_renderer_set_volume(gst_volume);
+    video_renderer_hls_set_volume(gst_volume);
 }
 
 extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat) {
