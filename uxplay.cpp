@@ -20,6 +20,8 @@
  * Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
  */
 
+#include "uxplay_api.h"
+
 #include <stddef.h>
 #include <cstring>
 #include <unistd.h>
@@ -40,8 +42,11 @@
 #include <glib.h>
 #include <unordered_map>
 #include <winsock2.h>
+#include <windows.h>
 #include <iphlpapi.h>
+#include <mutex>
 #include <pthread.h>   //for pthreads in MSYS2 UCRT
+#include <io.h>
 #else
 #include <csignal>
 #include <glib-unix.h>
@@ -145,6 +150,8 @@ static std::string metadata_filename = "";
 static bool do_append_hostname = true;
 static bool use_random_hw_addr = false;
 static unsigned short display[5] = {0}, tcp[3] = {0}, udp[3] = {0};
+static GMainLoop *g_loop = NULL;
+static bool do_shutdown = false;
 static bool debug_log = DEFAULT_DEBUG_LOG;
 static bool suppress_packet_debug_data = false;
 static int log_level = LOGGER_INFO;
@@ -221,31 +228,58 @@ static bool dbus_last_message = false;
 static const char *appname = DEFAULT_NAME;
 static const char *reason_always = "mirroring client: inhibit always";
 static const char *reason_active = "actively receiving video";
+#endif
+
+#if defined(DBUS) || defined(_WIN32)
 static float previous_hls_position = 0.0f;
 #endif
 
+#ifdef _WIN32
+static HANDLE windows_power_request = INVALID_HANDLE_VALUE;
+static bool windows_power_request_active = false;
+static std::mutex windows_power_request_mutex;
+#endif
 /* logging */
 
 static void log(int level, const char* format, ...) {
     va_list vargs;
     if (level > log_level) return;
+    const char *prefix = "";
     switch (level) {
     case 0:
     case 1:
     case 2:
     case 3:
-        printf("*** ERROR: ");
+        prefix = "*** ERROR: ";
         break;
     case 4:
-        printf("*** WARNING: ");
+        prefix = "*** WARNING: ";
         break;
     default:
         break;
     }
     va_start(vargs, format);
-    vprintf(format, vargs);
-    printf("\n");
+    va_list measure;
+    va_copy(measure, vargs);
+    const int length = vsnprintf(nullptr, 0, format, measure);
+    va_end(measure);
+    if (length < 0) {
+        va_end(vargs);
+        return;
+    }
+    std::vector<char> message(static_cast<size_t>(length) + 1);
+    vsnprintf(message.data(), message.size(), format, vargs);
     va_end(vargs);
+    std::string line(prefix);
+    line.append(message.data(), static_cast<size_t>(length));
+    if (line.empty() || line.back() != '\n') line += '\n';
+    // Emit the prefix, message and newline together to prevent interleaving.
+#ifdef _WIN32
+    // Unbuffered UCRT fwrite can split off its last byte; use one native write.
+    _write(_fileno(stdout), line.data(), static_cast<unsigned>(line.size()));
+#else
+    fwrite(line.data(), 1, line.size(), stdout);
+#endif
 }
 
 #define LOGD(...) log(LOGGER_DEBUG, __VA_ARGS__)
@@ -320,12 +354,141 @@ static void dbus_screensaver_inhibiter(bool inhibit) {
 }
 #endif
 
+#ifdef _WIN32
+static bool windows_screensaver_request_init() {
+    std::lock_guard<std::mutex> lock(windows_power_request_mutex);
+    if (windows_power_request != INVALID_HANDLE_VALUE) {
+        return true;
+    }
+
+    static wchar_t reason[] = L"UxPlay is displaying video";
+    REASON_CONTEXT context = {};
+    context.Version = POWER_REQUEST_CONTEXT_VERSION;
+    context.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING;
+    context.Reason.SimpleReasonString = reason;
+
+    windows_power_request = PowerCreateRequest(&context);
+    if (windows_power_request == INVALID_HANDLE_VALUE) {
+        LOGE("Unable to create Windows display power request (error %lu)",
+             static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+    return true;
+}
+
+static bool windows_screensaver_inhibiter(bool inhibit) {
+    std::lock_guard<std::mutex> lock(windows_power_request_mutex);
+    if (windows_power_request == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    if (windows_power_request_active == inhibit) {
+        return true;
+    }
+
+    BOOL success = inhibit
+        ? PowerSetRequest(windows_power_request, PowerRequestDisplayRequired)
+        : PowerClearRequest(windows_power_request, PowerRequestDisplayRequired);
+    if (!success) {
+        LOGE("Unable to %s Windows display power request (error %lu)",
+             inhibit ? "set" : "clear",
+             static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+
+    windows_power_request_active = inhibit;
+    LOGD("screen_saver: Windows display power request %s",
+         inhibit ? "active" : "released");
+    return true;
+}
+
+static bool windows_screensaver_is_inhibited() {
+    std::lock_guard<std::mutex> lock(windows_power_request_mutex);
+    return windows_power_request_active;
+}
+
+static void windows_screensaver_request_destroy() {
+    std::lock_guard<std::mutex> lock(windows_power_request_mutex);
+    if (windows_power_request == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    if (windows_power_request_active) {
+        if (!PowerClearRequest(windows_power_request, PowerRequestDisplayRequired)) {
+            LOGE("Unable to clear Windows display power request during shutdown (error %lu)",
+                 static_cast<unsigned long>(GetLastError()));
+        }
+        windows_power_request_active = false;
+    }
+    CloseHandle(windows_power_request);
+    windows_power_request = INVALID_HANDLE_VALUE;
+}
+#endif
+
+/*
+ * UxPlay receives filenames as UTF-8.  The narrow CRT file APIs interpret
+ * those bytes using the active Windows code page, which makes paths under a
+ * non-ASCII user profile inaccessible.  Keep the POSIX calls unchanged and
+ * use the wide CRT APIs on Windows.
+ */
+#ifdef _WIN32
+static std::wstring utf8_to_wide(const char *value) {
+    if (!value) {
+        return {};
+    }
+
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1,
+                                     nullptr, 0);
+    if (length == 0) {
+        return {};
+    }
+
+    std::wstring wide_value(length, L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1,
+                            &wide_value[0], length) == 0) {
+        return {};
+    }
+    wide_value.pop_back(); // Drop the terminating NUL included by length.
+    return wide_value;
+}
+
+static FILE *fopen_utf8(const char *filename, const char *mode) {
+    std::wstring wide_filename = utf8_to_wide(filename);
+    std::wstring wide_mode = utf8_to_wide(mode);
+    if (wide_filename.empty() || wide_mode.empty()) {
+        return nullptr;
+    }
+    return _wfopen(wide_filename.c_str(), wide_mode.c_str());
+}
+
+static int access_utf8(const char *filename, int mode) {
+    std::wstring wide_filename = utf8_to_wide(filename);
+    return wide_filename.empty() ? -1 : _waccess(wide_filename.c_str(), mode);
+}
+
+static int remove_utf8(const char *filename) {
+    std::wstring wide_filename = utf8_to_wide(filename);
+    return wide_filename.empty() ? -1 : _wremove(wide_filename.c_str());
+}
+#else
+static FILE *fopen_utf8(const char *filename, const char *mode) {
+    return fopen(filename, mode);
+}
+
+static int access_utf8(const char *filename, int mode) {
+    return access(filename, mode);
+}
+
+static int remove_utf8(const char *filename) {
+    return remove(filename);
+}
+#endif
+
 static bool file_has_write_access (const char * filename) {
     bool exists = false;
     bool write = false;
 #ifdef _WIN32
-    if ((exists = _access(filename, 0) != -1)) {
-        write = (_access(filename, 2) != -1);
+    if ((exists = access_utf8(filename, 0) != -1)) {
+        write = (access_utf8(filename, 2) != -1);
     }
 #else
     if ((exists = access(filename, F_OK) != -1)) {
@@ -333,11 +496,11 @@ static bool file_has_write_access (const char * filename) {
     }
 #endif
     if (!exists) {
-        FILE *fp = fopen(filename, "w");
+        FILE *fp = fopen_utf8(filename, "w");
         if (fp) {
             write = true;
 	    fclose(fp);
-	    remove(filename);
+	    remove_utf8(filename);
         }
     }
     return write;
@@ -353,7 +516,7 @@ static const unsigned char empty_image[] = {
     0x21, 0xbc, 0x33, 0x00, 0x00, 0x00, 0x00, 0x49,  0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82 };
 
 static size_t write_coverart(const char *filename, const void *image, size_t len) {
-    FILE *fp = fopen(filename, "wb");
+    FILE *fp = fopen_utf8(filename, "wb");
     if (!fp) {
         printf("Failed to open file %s\n", filename);
         return 0;
@@ -364,7 +527,7 @@ static size_t write_coverart(const char *filename, const void *image, size_t len
 }
 
 static size_t write_metadata(const char *filename, const char *text) {
-    FILE *fp = fopen(filename, "wb");
+    FILE *fp = fopen_utf8(filename, "wb");
     if (!fp) {
         printf("Failed to open file %s\n", filename);
         return 0;
@@ -377,7 +540,7 @@ static size_t write_metadata(const char *filename, const char *text) {
 static int write_bledata( const uint32_t *pid, const char *process_name, const char *filename) {
     char name[16] { 0 };
     size_t len = strlen(process_name);
-    FILE *fp = fopen(filename, "wb");
+    FILE *fp = fopen_utf8(filename, "wb");
     if (!fp) {
         printf("Failed to open file %s\n", filename);
         return 0;
@@ -478,7 +641,7 @@ static void dump_audio_to_file(unsigned char *data, int datalen, unsigned char t
             snprintf(suffix, sizeof(suffix), ".%d.aud", audio_dumpfile_count);
         }
         fn.append(suffix);
-        audio_dumpfile = fopen(fn.c_str(),"w");
+        audio_dumpfile = fopen_utf8(fn.c_str(),"w");
         if (audio_dumpfile == NULL) {
             LOGE("could not open file %s for dumping audio frames",fn.c_str());
         }
@@ -514,7 +677,7 @@ static void dump_video_to_file(unsigned char *data, int datalen) {
             fn.append(suffix);
         }
         fn.append(".h264");
-        video_dumpfile = fopen (fn.c_str(),"w");
+        video_dumpfile = fopen_utf8(fn.c_str(),"w");
         if (video_dumpfile == NULL) {
             LOGE("could not open file %s for dumping h264 frames",fn.c_str());
         }
@@ -669,7 +832,9 @@ static gboolean video_eos_watch_callback (gpointer loop) {
 static void main_loop()  {
     guint gst_video_bus_watch_id[MAX_VIDEO_RENDERERS] = { 0 };
     guint gst_audio_bus_watch_id[MAX_AUDIO_RENDERERS] = { 0 };
-    GMainLoop *loop = g_main_loop_new(NULL,FALSE);
+    //GMainLoop *loop = g_main_loop_new(NULL,FALSE);
+    g_loop = g_main_loop_new(NULL, FALSE);
+    GMainLoop *loop = g_loop;
     relaunch_video = false;
     monitor_progress = false;
     reset_loop = false;
@@ -1268,10 +1433,10 @@ static void parse_arguments (int argc, char *argv[]) {
                 fprintf(stderr, "invalid \"-scrsv %s\"; values 0, 1, 2 allowed\n", argv[i]);
                 exit(1);
             }
-#ifdef DBUS
+#if defined(DBUS) || defined(_WIN32)
             scrsv = n;
 #else
-            fprintf(stderr,"invalid: option \"-scrsv\" is currently only implemented for Linux/*BSD systems with D-Bus service\n");
+            fprintf(stderr,"invalid: option \"-scrsv\" is currently only implemented for Windows and Linux/*BSD systems with D-Bus service\n");
             exit(1);
 #endif
         } else if (arg == "-vsync") {
@@ -2212,7 +2377,7 @@ extern "C" const char *passwd(void *cls, int *len){
 
 extern "C" void export_dacp(void *cls, const char *active_remote, const char *dacp_id) {
       if (dacpfile.length()) {
-        FILE *fp = fopen(dacpfile.c_str(), "w");
+        FILE *fp = fopen_utf8(dacpfile.c_str(), "w");
         if (fp) {
             fprintf(fp,"%s\n%s\n", dacp_id, active_remote);
             fclose(fp);
@@ -2238,7 +2403,7 @@ extern "C" void conn_destroy (void *cls) {
             audio_renderer_stop();
         }
         if (dacpfile.length()) {
-            remove (dacpfile.c_str());
+            remove_utf8(dacpfile.c_str());
         }
         if (mux_to_file) {
             mux_renderer_stop();
@@ -2353,12 +2518,16 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
     }
 }
 
-#ifdef DBUS
+#if defined(DBUS) || defined(_WIN32)
 extern "C" void mirror_video_running  (void *cls, bool is_running) {
     if (scrsv != 1) {
         return;
     }
+#ifdef DBUS
     dbus_screensaver_inhibiter(is_running);
+#elif defined(_WIN32)
+    windows_screensaver_inhibiter(is_running);
+#endif
 }
 #endif
 
@@ -2563,7 +2732,7 @@ extern "C" void register_client(void *cls, const char *device_id, const char *cl
     LOGI("registered new client: %s DeviceID = %s PK = \n%s", client_name, device_id, client_pk);
     registered_keys.push_back(client_pk);
     if (strlen(pairing_register.c_str())) {
-        FILE *fp = fopen(pairing_register.c_str(), "a");
+        FILE *fp = fopen_utf8(pairing_register.c_str(), "a");
         if (fp) {
             fprintf(fp, "%s,%s,%s\n", client_pk, device_id, client_name);
             fclose(fp);
@@ -2642,14 +2811,28 @@ extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *play
     playback_info->ready_to_play = true; //?
     playback_info->playback_likely_to_keep_up = true; //?
     
-#ifdef DBUS
+#if defined(DBUS) || defined(_WIN32)
     /*  this seems to be  called every second for first 900 secs (15 mins?) of HLS video, and subsequently
-	at 30 second intervals (use it to signal HLS video activity to  the  DBus screensaver inhibitor) */
+	at 30 second intervals (use it to signal HLS video activity to the screensaver inhibitor) */
     if (scrsv == 1) {
-        if (playback_info->position > previous_hls_position && !dbus_last_message) {
+        bool screensaver_is_inhibited = false;
+#ifdef DBUS
+        screensaver_is_inhibited = dbus_last_message;
+#elif defined(_WIN32)
+        screensaver_is_inhibited = windows_screensaver_is_inhibited();
+#endif
+        if (playback_info->position > previous_hls_position && !screensaver_is_inhibited) {
+#ifdef DBUS
             dbus_screensaver_inhibiter(true);
-        } else if (playback_info->position == previous_hls_position && dbus_last_message) {
+#elif defined(_WIN32)
+            windows_screensaver_inhibiter(true);
+#endif
+        } else if (playback_info->position == previous_hls_position && screensaver_is_inhibited) {
+#ifdef DBUS
             dbus_screensaver_inhibiter(false);
+#elif defined(_WIN32)
+            windows_screensaver_inhibiter(false);
+#endif
         }
         previous_hls_position = playback_info->position;
     }
@@ -2664,22 +2847,8 @@ extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *play
 }
 
 extern "C" void log_callback (void *cls, int level, const char *msg) {
-    switch (level) {
-    case LOGGER_DEBUG:
-        LOGD("%s", msg);
-        break;
-    case LOGGER_WARNING:
-        LOGW("%s", msg);
-        break;
-    case LOGGER_INFO:
-        LOGI("%s", msg);
-        break;
-    case LOGGER_ERR:
-        LOGE("%s", msg);
-        break;
-    default:
-        break;
-    }
+    // Preserve DEBUG_DATA, NOTICE and critical levels as well.
+    log(level, "%s", msg);
 }
 
 static int start_raop_server (unsigned short display[5], unsigned short tcp[3], unsigned short udp[3], bool debug_log) {
@@ -2711,7 +2880,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.export_dacp = export_dacp;
     raop_cbs.video_reset = video_reset;
     raop_cbs.video_set_codec = video_set_codec;
-#ifdef DBUS
+#if defined(DBUS) || defined(_WIN32)
     raop_cbs.mirror_video_running = mirror_video_running;
 #endif
     raop_cbs.on_video_play = on_video_play;
@@ -2865,16 +3034,16 @@ static void read_config_file(const char * filename, const char * uxplay_name) {
 /* workaround for GStreamer >= 1.22 "Official Builds" on macOS */
 #include <TargetConditionals.h>
 #include <gst/gstmacos.h>
-void real_main (int argc, char *argv[]);
+static void real_main (int argc, char *argv[]);
 
-int main (int argc, char *argv[]) {
+int start_uxplay (int argc, char *argv[]) {
     LOGI("*=== Using gst_macos_main wrapper for GStreamer >= 1.22 on macOS ===*");
     return  gst_macos_main ((GstMainFunc) real_main, argc, argv , NULL);
 }
 
-void real_main (int argc, char *argv[]) {
+static void real_main (int argc, char *argv[]) {
 #else
-int main (int argc, char *argv[]) {
+int start_uxplay (int argc, char *argv[]) {
 #endif
     std::vector<char> server_hw_addr;
     std::string config_file = "";
@@ -2944,11 +3113,9 @@ int main (int argc, char *argv[]) {
     }
 
     
-#ifdef _WIN32    /*  use utf-8 terminal output; don't buffer stdout in WIN32 when debug_log = false */
+#ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
-    if (!debug_log) {
-        setbuf(stdout, NULL);
-    }
+    // The GUI host configures unbuffered output before the first write.
 #endif
 
     LOGI("UxPlay %s: An Open-Source AirPlay mirroring and audio-streaming server.", VERSION);
@@ -3000,6 +3167,25 @@ int main (int argc, char *argv[]) {
              (scrsv == 1 ? "while displaying mirrored or streamed video" : "always"));
         if (scrsv == 2) {
             dbus_screensaver_inhibiter(true);
+        }
+    }
+#endif
+#ifdef _WIN32
+    if (scrsv && !use_video) {
+        LOGI("-scrsv = %d will be ignored, as no video will be rendered", scrsv);
+        scrsv = 0;
+    }
+    if (scrsv) {
+        if (!windows_screensaver_request_init()) {
+            LOGW("Windows screensaver inhibition will not be active");
+            scrsv = 0;
+        } else {
+            LOGI("Will use Windows display power requests to inhibit the screensaver %s",
+                 (scrsv == 1 ? "while displaying mirrored or streamed video" : "always"));
+            if (scrsv == 2 && !windows_screensaver_inhibiter(true)) {
+                LOGW("Windows screensaver inhibition will not be active");
+                scrsv = 0;
+            }
         }
     }
 #endif
@@ -3232,6 +3418,13 @@ int main (int argc, char *argv[]) {
     compression_type = 0;
     close_window = new_window_closing_behavior;
     main_loop();
+        if (do_shutdown) {
+        LOGI("Stopping RAOP Server...");
+        stop_raop_server();
+        stop_dnssd();
+        cleanup();
+        return 0;
+    }
     if (relaunch_video) {
         if (reset_httpd) {
             raop_stop_httpd(raop);
@@ -3269,7 +3462,17 @@ int main (int argc, char *argv[]) {
     }
     cleanup();
 }
- 
+
+void stop_uxplay() {
+    do_shutdown = true;
+    reset_loop = true;
+    stop_raop_server();
+    stop_dnssd();
+    if (g_loop && g_main_loop_is_running(g_loop)) {
+        g_main_loop_quit(g_loop);
+    }
+}
+
 static void cleanup() {
     if (use_audio) {
         audio_renderer_destroy();
@@ -3287,13 +3490,13 @@ static void cleanup() {
         fclose(video_dumpfile);
     }
     if (coverart_filename.length()) {
-        remove (coverart_filename.c_str());
+        remove_utf8(coverart_filename.c_str());
     }
     if (metadata_filename.length()) {
-        remove (metadata_filename.c_str());
+        remove_utf8(metadata_filename.c_str());
     }
     if (ble_filename.length()) {
-        remove (ble_filename.c_str());
+        remove_utf8(ble_filename.c_str());
     }
 #ifdef DBUS
     if (dbus_connection) {
@@ -3307,6 +3510,9 @@ static void cleanup() {
         }
         dbus_connection_unref(dbus_connection);
     }
+#endif
+#ifdef _WIN32
+    windows_screensaver_request_destroy();
 #endif
     exit(0);
 }
